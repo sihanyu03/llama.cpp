@@ -520,6 +520,61 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// graph shapes must not depend on causal_attn: a flip rebuilds the graph without a scheduler reserve, so a shape that depends on it reallocates the compute buffers mid-run and aborts under GGML_SCHED_NO_REALLOC
+// batches: small then large, both >= n_ubatch/2 so the ops are placed like the reserve graph
+// the second has the same node count as the first but larger tensors, so it reallocates at an unchanged graph size, which is exactly what the flag catches
+static bool check_causal_attn_toggle(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_past   = tokens.size();
+    const uint32_t n_ubatch = llama_n_ubatch(lctx);
+
+    GGML_ASSERT(n_past + n_ubatch/2 + n_ubatch + 1 <= llama_n_ctx(lctx));
+
+    const std::vector<std::pair<bool, uint32_t>> steps = {
+        { false, n_ubatch/2 },
+        { false, n_ubatch   },
+        { true,  1          },
+    };
+
+    llama_batch batch = llama_batch_init(n_ubatch, 0, 1);
+
+    bool ok = true;
+    uint32_t pos = n_past;
+    for (const auto & [causal, n_tokens] : steps) {
+        llama_set_causal_attn(lctx, causal);
+
+        batch.n_tokens = 0;
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            common_batch_add(batch, tokens[i], pos++, {0}, true);
+        }
+
+        const int rc = llama_decode(lctx, batch);
+        if (rc != 0) {
+            LOG_ERR("%s: causal_attn=%d n_tokens=%u: llama_decode returned %d\n", __func__, causal, n_tokens, rc);
+            ok = false;
+            break;
+        }
+
+        const float * logits = llama_get_logits_ith(lctx, n_tokens - 1);
+        if (logits == nullptr) {
+            LOG_ERR("%s: causal_attn=%d n_tokens=%u: no logits\n", __func__, causal, n_tokens);
+            ok = false;
+            break;
+        }
+        for (uint32_t j = 0; j < n_vocab; j++) {
+            if (std::isnan(logits[j])) {
+                LOG_ERR("%s: causal_attn=%d n_tokens=%u: nan logit\n", __func__, causal, n_tokens);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    llama_batch_free(batch);
+    return ok;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -840,6 +895,17 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (nmse_val > 1e-4) {
                             test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+                        // FIXME: under tensor split these batches hit a GGML_ASSERT in ggml-backend-meta.cpp
+                        if (!encode && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                            llama_model   * model_dev = model_and_ctx_dev.first.get();
+                            llama_context * lctx_dev  = model_and_ctx_dev.second.get();
+                            if (!check_causal_attn_toggle(model_dev, lctx_dev, tokens)) {
+                                test_ok = false;
+                                if (status_nmse.find("FAIL") == std::string::npos) {
+                                    status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
+                                }
+                            }
                         }
                     }
 
